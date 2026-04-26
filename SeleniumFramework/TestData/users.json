@@ -1,0 +1,15 @@
+{
+  "users": [
+    {
+      "role":     "admin",
+      "username": "admin@qa.com",
+      "password": "REPLACE_WITH_SECRET",
+      "note":     "Do not commit real passwords — use Azure Key Vault secrets"
+    },
+    {
+      "role":     "readonly",
+      "username": "readonly@qa.com",
+      "password": "REPLACE_WITH_SECRET"
+    }
+  ]
+}

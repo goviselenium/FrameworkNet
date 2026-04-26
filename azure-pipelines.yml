@@ -1,0 +1,225 @@
+trigger:
+  branches:
+    include: [ main, release/* ]
+  paths:
+    exclude: [ "*.md", docs/** ]
+
+pr:
+  branches:
+    include: [ main ]
+
+# ── Queue-time parameters — selectable when manually triggering the pipeline ──
+parameters:
+  - name:  testCategory
+    type:  string
+    default: Smoke
+    values: [ Smoke, Regression, "Smoke|Regression" ]
+
+  - name:  targetEnvironment
+    type:  string
+    default: QA
+    values: [ Dev, QA, UAT, Prod ]
+
+# ── Pipeline-wide variables ────────────────────────────────────────────────────
+variables:
+  - group: selenium-framework-secrets   # Azure Key Vault–linked variable group
+  - name:  dotnetVersion
+    value: '8.x'
+  - name:  buildConfig
+    value: 'Release'
+  - name:  testProject
+    value: 'SeleniumFramework/SeleniumFramework.csproj'
+  - name:  testResultsDir
+    value: '$(Agent.TempDirectory)/TestResults'
+  - name:  artifactDir
+    value: '$(Build.ArtifactStagingDirectory)'
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 1 — Build
+# ══════════════════════════════════════════════════════════════════════════════
+stages:
+- stage: Build
+  displayName: '🔧 Restore & Build'
+  jobs:
+  - job: BuildJob
+    displayName: 'Build — .NET 8'
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Install .NET 8 SDK'
+      inputs:
+        version: $(dotnetVersion)
+        performMultiLevelLookup: true
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore NuGet packages'
+      inputs:
+        command:  restore
+        projects: '**/*.csproj'
+        feedsToUse: select
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build solution'
+      inputs:
+        command:   build
+        projects:  '**/*.csproj'
+        arguments: '--configuration $(buildConfig) --no-restore'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish build output'
+      inputs:
+        targetPath: '$(Build.BinariesDirectory)'
+        artifact:   'build-$(Build.BuildNumber)'
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 2 — Test
+# ══════════════════════════════════════════════════════════════════════════════
+- stage: Test
+  displayName: '🧪 ${{ parameters.testCategory }} · ${{ parameters.targetEnvironment }} · Edge Headless'
+  dependsOn: Build
+  condition: succeeded()
+
+  jobs:
+  - job: TestJob
+    displayName: 'Run ${{ parameters.testCategory }} Tests'
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    variables:
+      TEST_ENV:              ${{ parameters.targetEnvironment }}
+      TestSettings__Browser: 'Edge'
+      TestSettings__Headless: 'true'
+      # Secrets resolved from Azure Key Vault via variable group — never in source code
+      Credentials__Username: $(AUT-Username)
+      Credentials__Password: $(AUT-Password)
+
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Install .NET 8 SDK'
+      inputs:
+        version: $(dotnetVersion)
+
+    - script: |
+        sudo apt-get update -q
+        curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+          | sudo gpg --dearmor -o /usr/share/keyrings/microsoft.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] \
+          https://packages.microsoft.com/repos/edge stable main" \
+          | sudo tee /etc/apt/sources.list.d/microsoft-edge.list
+        sudo apt-get update -q
+        sudo apt-get install -y microsoft-edge-stable
+        microsoft-edge --version
+      displayName: 'Install Microsoft Edge'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore packages'
+      inputs:
+        command:  restore
+        projects: $(testProject)
+
+    - script: |
+        mkdir -p $(testResultsDir)
+        mkdir -p $(artifactDir)/screenshots
+        mkdir -p $(artifactDir)/reports
+        mkdir -p $(artifactDir)/logs
+      displayName: 'Create output directories'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Run ${{ parameters.testCategory }} tests (parallel, Edge headless)'
+      inputs:
+        command:   test
+        projects:  $(testProject)
+        arguments: >
+          --configuration $(buildConfig)
+          --no-build
+          --settings .runsettings
+          --filter "Category=${{ parameters.testCategory }}"
+          --logger "trx;LogFileName=TestResults.trx"
+          --logger "nunit;LogFileName=NUnitResults.xml"
+          --results-directory $(testResultsDir)
+      env:
+        TEST_ENV:              ${{ parameters.targetEnvironment }}
+        Credentials__Username: $(AUT-Username)
+        Credentials__Password: $(AUT-Password)
+      continueOnError: true   # Always publish artifacts even when tests fail
+
+    # ── Publish TRX → Azure DevOps Tests tab ──────────────────────────────
+    - task: PublishTestResults@2
+      displayName: 'Publish TRX results (Azure DevOps Tests tab)'
+      condition: always()
+      inputs:
+        testResultsFormat:     VSTest
+        testResultsFiles:      '$(testResultsDir)/**/*.trx'
+        mergeTestResults:      true
+        failTaskOnFailedTests: true
+        testRunTitle:          '${{ parameters.testCategory }} | ${{ parameters.targetEnvironment }} | #$(Build.BuildNumber)'
+
+    # ── Publish NUnit XML ──────────────────────────────────────────────────
+    - task: PublishTestResults@2
+      displayName: 'Publish NUnit XML results'
+      condition: always()
+      inputs:
+        testResultsFormat: NUnit
+        testResultsFiles:  '$(testResultsDir)/**/*.xml'
+        mergeTestResults:  true
+
+    # ── Collect Extent HTML report ─────────────────────────────────────────
+    - task: CopyFiles@2
+      displayName: 'Collect Extent HTML report'
+      condition: always()
+      inputs:
+        SourceFolder:  '$(System.DefaultWorkingDirectory)/TestArtifacts/Reports'
+        Contents:      '**/*.html'
+        TargetFolder:  '$(artifactDir)/reports'
+
+    # ── Collect screenshots ────────────────────────────────────────────────
+    - task: CopyFiles@2
+      displayName: 'Collect failure screenshots'
+      condition: always()
+      inputs:
+        SourceFolder:  '$(System.DefaultWorkingDirectory)/TestArtifacts/Screenshots'
+        Contents:      '**/*.png'
+        TargetFolder:  '$(artifactDir)/screenshots'
+
+    # ── Collect Serilog logs ───────────────────────────────────────────────
+    - task: CopyFiles@2
+      displayName: 'Collect Serilog logs'
+      condition: always()
+      inputs:
+        SourceFolder:  '$(System.DefaultWorkingDirectory)/TestArtifacts/Logs'
+        Contents:      '**/*.log'
+        TargetFolder:  '$(artifactDir)/logs'
+
+    # ── Publish all artifacts ──────────────────────────────────────────────
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish test artifacts (reports · screenshots · logs)'
+      condition: always()
+      inputs:
+        targetPath: '$(artifactDir)'
+        artifact:   'test-artifacts-${{ parameters.testCategory }}-${{ parameters.targetEnvironment }}-$(Build.BuildNumber)'
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 3 — Summary
+# ══════════════════════════════════════════════════════════════════════════════
+- stage: Notify
+  displayName: '📣 Pipeline Summary'
+  dependsOn: Test
+  condition: always()
+
+  jobs:
+  - job: Summary
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        echo "============================================"
+        echo "  Pipeline:    $(Build.DefinitionName)"
+        echo "  Build:       $(Build.BuildNumber)"
+        echo "  Category:    ${{ parameters.testCategory }}"
+        echo "  Environment: ${{ parameters.targetEnvironment }}"
+        echo "  Browser:     Edge Headless"
+        echo "  Triggered:   $(Build.RequestedFor)"
+        echo "============================================"
+      displayName: 'Print pipeline summary'

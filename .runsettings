@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RunSettings>
+  <NUnit>
+    <!-- Match to CPU cores on Azure agent (Standard_D4s_v3 = 4 cores) -->
+    <NumberOfTestWorkers>4</NumberOfTestWorkers>
+    <DefaultTimeout>120000</DefaultTimeout>
+    <StopOnError>false</StopOnError>
+  </NUnit>
+  <RunConfiguration>
+    <MaxCpuCount>4</MaxCpuCount>
+    <ResultsDirectory>TestResults</ResultsDirectory>
+    <TestSessionTimeout>600000</TestSessionTimeout>
+  </RunConfiguration>
+</RunSettings>
